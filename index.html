@@ -5272,6 +5272,38 @@ if (typeof module !== "undefined") module.exports = LAB;
     return idxify(g);
   }
   // cylinder radius r, from point a along unit dir d for length L
+  // 2026-11-25 (corty: "add the constant force springs, rack and pinion gears and animate the gears"):
+  // involute gear outline (same maths as cad/gears.py: m, z, profile shift x, 20 deg, tooth thinned 0.10), centred on (0, 0),
+  // tooth 0 centred at angle `phase`; returns [[u, v], ...]
+  function gearPts(z, m = 1, x = 0, phase = 0, n = 7) {
+    const PA = 20 * Math.PI / 180, inv = (a) => Math.tan(a) - a, rp = m * z / 2, rb = rp * Math.cos(PA), ra = rp + m * (1 + x), rf = rp - m * (1.25 - x);
+    const psi = (Math.PI * m / 2 + 2 * x * m * Math.tan(PA) - 0.10) / (2 * rp), th = (r) => psi + inv(PA) - inv(Math.acos(Math.min(1, rb / r)));
+    const r0 = Math.max(rb, rf), thb = th(r0), tha = th(ra), pts = [], pol = (r, a) => [r * Math.cos(a), r * Math.sin(a)];
+    for (let k = 0; k < z; k++) {
+      const c = phase + 2 * Math.PI * k / z, c1 = c + 2 * Math.PI / z;
+      for (let i = 0; i <= n; i++) { const r = r0 + (ra - r0) * i / n; pts.push(pol(r, c - th(r))); }
+      for (let i = 1; i < 4; i++) pts.push(pol(ra, c - tha + 2 * tha * i / 4));
+      for (let i = n; i >= 0; i--) { const r = r0 + (ra - r0) * i / n; pts.push(pol(r, c + th(r))); }
+      if (rf < rb) pts.push(pol(rf, c + thb));
+      for (let i = 1; i < 4; i++) pts.push(pol(rf, c + thb + (c1 - thb - c - thb) * i / 4));
+      if (rf < rb) pts.push(pol(rf, c1 - thb));
+    }
+    return pts;
+  }
+  function mergeGeos(list) {                                                   // one body from several (triangle soup, then indexed)
+    const parts = list.map((g) => (g.index ? g.toNonIndexed() : g).attributes.position.array), n = parts.reduce((s, a) => s + a.length, 0), out = new Float32Array(n);
+    let o = 0; for (const a of parts) { out.set(a, o); o += a.length; }
+    const g = new THREE.BufferGeometry(); g.setAttribute("position", new THREE.BufferAttribute(out, 3)); g.computeVertexNormals(); return idxify(g);
+  }
+  const circPts = (cx, cy, r, n = 48) => Array.from({ length: n }, (_, i) => [cx + r * Math.cos(2 * Math.PI * i / n), cy + r * Math.sin(2 * Math.PI * i / n)]);
+  // m1 20 deg rack profile (Y along the rack, Z up): tips at zTip, a GAP centred on yGap (a pinion tooth sits there), from y0..y1 down to zBot
+  function rackPts(y0, y1, zTip, zBot, yGap, m = 1) {
+    const p = Math.PI * m, s = p / 2 - 0.10, t = Math.tan(20 * Math.PI / 180), zp = zTip - m, zr = zp - 1.25 * m, top = [];
+    const tw = s / 2 - m * t, bw = s / 2 + 1.25 * m * t;                       // tooth half widths at the tip and the root
+    for (let c = yGap + p / 2 - Math.ceil((yGap - y0) / p + 1) * p; c < y1 + p; c += p)
+      for (const [y, zz] of [[c - bw, zr], [c - tw, zTip], [c + tw, zTip], [c + bw, zr]]) if (y > y0 && y < y1) top.push([y, zz]);
+    return [[y0, zBot], [y1, zBot], [y1, zr], ...top.reverse(), [y0, zr]];
+  }
   function gCyl(a, d, L, r, n = 24) {
     const g = new THREE.CylinderGeometry(r, r, L, n);
     g.applyMatrix4(new THREE.Matrix4().makeRotationFromQuaternion(new THREE.Quaternion().setFromUnitVectors(EV(0, 1, 0), d.clone().normalize())));
@@ -5400,11 +5432,23 @@ if (typeof module !== "undefined") module.exports = LAB;
     // ---------------- side panel rail subassembly ST-E10: the real SolidWorks parts (cad/export_side_parts.py) at the closed pose;
     // the moving ones ride the carriages along the dogleg. The conflict checks still use LAB's boxes (same design values).
     const S = window.SIDE_PARTS;
+    const RG = LAB.reelGeo(); ENC.spin = [];
     if (S) for (const i of S.inst) {
       const p = S.parts[i.part];
+      if (/^ST-EH9 /.test(i.part)) continue;                                   // the spring coil is drawn live below (its size changes with the band out)
       const sg = sideGeo(i);                                                   // sets i.fixNote when a stale SolidWorks mesh is drawn at its new size (floor up 11.6)
-      encAdd(sg, i.group, i.moving ? "panel" : "fixed", i.part + (i.where ? ` (${i.where})` : ""),
-        R_INFO([...p.props, ["Moves", i.moving ? "with the side panel (rides the carriages)" : "no (fixed)"], ["Model", `SolidWorks ST-E10 · ${i.comp}`], ...(i.fixNote ? [["Floor up 11.6 (v3 step 3)", i.fixNote]] : [])]), p.hex).sub = true;
+      // the drum + its 12T gear turn with the band; the 30T damper gear turns the other way, 12/30 as fast
+      const spin = /^ST-E26 |^ST-EH26 /.test(i.part) ? { c: [RG.x, RG.y], k: 1 } : /^ST-EH27 /.test(i.part) ? { c: [RG.damper.x, RG.damper.y], k: -RG.gears.zd / RG.gears.zg } : null;
+      const o = encAdd(sg, i.group, i.moving ? "panel" : "fixed", i.part + (i.where ? ` (${i.where})` : ""),
+        R_INFO([...p.props, ["Moves", i.moving ? "with the side panel (rides the carriages)" : spin ? "turns with the spring drum (animated)" : "no (fixed)"], ["Model", `SolidWorks ST-E10 · ${i.comp}`], ...(i.fixNote ? [["Floor up 11.6 (v3 step 3)", i.fixNote]] : [])]), p.hex);
+      o.sub = true; if (spin) { o.spin = spin; ENC.spin.push(o); }
+    }
+    {                                                                          // door spring: coil (live size) + band ribbon, turn lines on the coil
+      const R = LAB.REEL, b = RG.band, info = R_INFO([["Part", "ST-EH9 constant force spring 0.2 x 13 x ID14 x 600 (stainless)"], ["Coil", `on the D${R.hubD} hub of the ST-E26 drum; OD ${(2 * RG.coilClosed).toFixed(1)} closed .. ${(2 * RG.coilOpen).toFixed(1)} open`],
+        ["Moves", "live: the coil grows as the band winds in (door opening); the band runs to the ST-E28 clip on the lower carriage"]]);
+      ENC.doorCoil = { c: [RG.x, RG.y], hub: R.hubD / 2, t: R.bandT, z: [b[0], b[1]], o: encAdd(gBox(0, 1, 0, 1, 0, 1), "panelmech", "fixed", "Door spring coil ST-EH9 (constant force)", info, 0xb8c2cc),
+        band: encAdd(gBox(0, 1, 0, 1, 0, 1), "panelmech", "fixed", "Door spring band (0.2 x 13, drawn 0.4)", info, 0xb8c2cc), turns: encLine("coilturns", "panelmech", 0x34495e) };
+      ENC.doorCoil.o.sub = ENC.doorCoil.band.sub = true;
     }
     {                                                                          // +X wall braces: 2 ply ribs square to the wall
       const b = LAB.braceGeo();
@@ -5429,11 +5473,28 @@ if (typeof module !== "undefined") module.exports = LAB;
       return sh.plane === "z" ? gPrismZ(sh.outer, sh.z[0], sh.z[1], holes) : sh.plane === "y" ? gPrismY(sh.outer, sh.y[0], sh.y[1], holes) : gPrismX(sh.outer, sh.x[0], sh.x[1], holes); };
     const shapeOf = (p) => p.shape ? extrude(p.shape) : p.cyl ? gCyl(EV(...p.cyl.a), EV(...p.cyl.d), p.cyl.L, p.cyl.r) : p.ball ? idxify(new THREE.SphereGeometry(5, 16, 12).translate(...p.ball)) : gBox(...p.b);
     // v2.3 (2026-11-14): o.drx = see-through in the "Drawer mechanism" view (carriage bars, slides, track plate) so the four-bar shows
+    const pin = DG.mv.find((p) => p.part === "ST-EH24" && p.cyl);
     for (const p of DG.mv) { if (p.ghost) continue;                                     // ghost = a checked envelope (the cable route), not a body
+      if (p === pin) {                                                                 // the damper gear: real involute teeth, rolls on the rack (animated)
+        const c = p.cyl, rp = c.r - 1, z = Math.round(2 * rp), geo = gPrismX(gearPts(z, 1, 0, -Math.PI / 2), c.a[0], c.a[0] + c.L, [circPts(0, 0, 2.5, 20)]);
+        const o = encAdd(geo, p.grp || "drawermech", "fixed", p.nm, R_INFO([...(p.part ? [["Part", p.part]] : []), ...p.rows, ["Moves", "rides the carriage and rolls on the rack: turns d / r (animated)"]]), p.hex);
+        o.gearX = { y: c.a[1], z: c.a[2], rp }; ENC.drGear = o; continue; }
+      if (/^ST-E41$/.test(p.part)) continue;
       const o = encAdd(shapeOf(p), p.grp || "drawermech", "drawer", p.nm, dr(p), p.hex); if (/Carriage bar|Slide/.test(p.nm)) o.drx = true; }
     for (const p of DG.tray) if (!p.device || D.devIn) encAdd(shapeOf(p), p.grp || "drawer", "tray", p.nm, dr(p), p.hex);   // v2: turns about the pivot
     for (const p of DG.fx) {
+      if (p.part === "ST-E41" && p.cyl) {                                     // drawer spring drum (turns) + coil (live size) + band ribbon
+        const c = p.cyl, D = LAB.D, hub = D.hubD / 2, zb = [DG.reel.zb0, DG.reel.zb1], info = (t) => R_INFO([["Part", p.part], ...p.rows, ["Moves", t]]);
+        const fl = (z0, z1) => gPrismZ(circPts(0, 0, c.r, 48), z0, z1, [circPts(0, 0, 3.05, 16), ...[0, 1, 2].map((k) => circPts(8.5 * Math.cos(2.094 * k), 8.5 * Math.sin(2.094 * k), 2, 12))]);
+        const g = mergeGeos([fl(c.a[2], zb[0] - 0.3), gPrismZ(circPts(0, 0, hub, 32), zb[0] - 0.3, zb[1] + 0.3, [circPts(0, 0, 3.05, 16)]), fl(zb[1] + 0.3, c.a[2] + c.L)]);
+        const o = encAdd(g, "drawermech", "fixed", "Drawer reel drum ST-E41 (POM, turns with the band)", info("turns as the band winds in or out (animated)"), 0x6c3483);
+        o.spin = { c: [c.a[0], c.a[1]], drawer: true, local: true }; ENC.spin.push(o);   // geometry centred on the drum axis
+        ENC.drCoil = { c: [c.a[0], c.a[1]], hub, t: D.springT, z: zb, o: encAdd(gBox(0, 1, 0, 1, 0, 1), "drawermech", "fixed", "Drawer spring coil (constant force 0.2 x 13 x ID14 x 600)", info("live: the coil shrinks as the drawer closes (band pulled out)"), 0xb8c2cc),
+          band: encAdd(gBox(0, 1, 0, 1, 0, 1), "drawermech", "fixed", "Drawer spring band (0.2 x 13, drawn 0.4)", info("live: from the coil to the ST-E40 anchor on the carriage"), 0xb8c2cc), turns: encLine("coilturns", "drawermech", 0x34495e) };
+        continue;
+      }
       let geo = shapeOf(p);
+      if (p.part === "ST-EH16" && pin) { const b = p.b; geo = gPrismX(rackPts(b[2], b[3], b[5], b[4], pin.cyl.a[1]), b[0], b[1]); }   // real m1 teeth, a gap under the pinion's tooth at d 0
       if (p.track && p.track.length > 2 && !p.shape) {                       // the track plate with its real slot cut through (6.2 wide)
         const pts = p.track.filter((_, i) => i % 4 === 0 || i === p.track.length - 1), L = [], Rt = [];
         pts.forEach((q, i) => { const a = pts[Math.max(0, i - 1)], b = pts[Math.min(pts.length - 1, i + 1)], dy = b[0] - a[0], dz = b[1] - a[1], n = Math.hypot(dy, dz) || 1;
@@ -5628,6 +5689,30 @@ if (typeof module !== "undefined") module.exports = LAB;
     if (ENC.drBand && DG) {                                        // band: coil tangent (fixed, -X side of the coil) -> anchor tab (moves)
       const e = Math.max(0, LAB.drBand(dd)), r = Math.sqrt((D.hubD / 2) ** 2 + (D.springL - e) * D.springT / Math.PI), zb = (DG.reel.zb0 + DG.reel.zb1) / 2;
       ENC.drBand.geometry.setFromPoints([EV(DG.reel.x - r, DG.reel.y, zb), EV(DG.reel.x - r, DG.anchorY - dd, zb)]);
+    }
+    // springs + gears (2026-11-25): drum angle from the band wound in: de = r dθ with r² = hub² + (L - e) t / π  ->  θ = 2π / t · (r0 - r)
+    {
+      const RG = LAB.reelGeo(), R = LAB.REEL, eD = RG.hole.y + s.y - RG.y, rD = LAB.coilR(eD), thD = 2 * Math.PI / R.bandT * (RG.coilClosed - rD);   // door: + = CCW from above (closing)
+      const eW = Math.max(0, LAB.drBand(dd)), rW = (e) => Math.sqrt((D.hubD / 2) ** 2 + (D.springL - e) * D.springT / Math.PI), thW = 2 * Math.PI / D.springT * (rW(eW) - rW(LAB.drBand(0)));
+      for (const o of ENC.spin || []) {
+        const a = o.spin.drawer ? thW : thD * o.spin.k, [cx, cy] = o.spin.c, ca = Math.cos(a), sa = Math.sin(a);
+        o.mesh.rotation.set(0, 0, a);
+        if (o.spin.local) o.mesh.position.set(ENC_OFF.x + cx, ENC_OFF.y + cy, ENC_OFF.z);
+        else o.mesh.position.set(ENC_OFF.x + cx - (cx * ca - cy * sa), ENC_OFF.y + cy - (cx * sa + cy * ca), ENC_OFF.z);
+      }
+      if (ENC.drGear) { const g = ENC.drGear.gearX; ENC.drGear.mesh.position.set(ENC_OFF.x, ENC_OFF.y + g.y - dd, ENC_OFF.z + g.z); ENC.drGear.mesh.rotation.set(dd / g.rp, 0, 0); }
+      // coil = ring hub..r (rebuilt when r changes), a spiral line on its top face turning with the drum, band = thin ribbon from the coil tangent to the anchor
+      const coil = (C, r, a, x1, y1, side) => {
+        if (!C) return; const [cx, cy] = C.c, z0 = C.z[0], z1 = C.z[1];
+        if (Math.abs((C.r || 0) - r) > 0.01) { C.r = r; C.o.mesh.geometry.dispose(); C.o.mesh.geometry = gPrismZ(circPts(cx, cy, r, 64), z0, z1, [circPts(cx, cy, C.hub, 32)]); }
+        const turns = Math.max(1, (r - C.hub) / C.t), sp = []; const N = Math.min(6, turns);       // draw up to 6 turns (one line per ~turn spacing scaled)
+        for (let i = 0; i <= 120; i++) { const f = i / 120, rr = C.hub + (r - C.hub) * f, ph = a + 2 * Math.PI * N * f; sp.push(EV(cx + rr * Math.cos(ph), cy + rr * Math.sin(ph), z1 + 0.05)); }
+        C.turns.geometry.setFromPoints(sp);
+        const x0 = cx + side * r, y0 = cy, L = Math.hypot(x1 - x0, y1 - y0) || 1, nx = -(y1 - y0) / L * 0.2, ny = (x1 - x0) / L * 0.2;
+        C.band.mesh.geometry.dispose(); C.band.mesh.geometry = gPrismZ([[x0 + nx, y0 + ny], [x1 + nx, y1 + ny], [x1 - nx, y1 - ny], [x0 - nx, y0 - ny]], z0, z1);
+      };
+      const bd = LAB.bandAt(LAB.st.q); coil(ENC.doorCoil, rD, thD, bd.x1, bd.y1, 1);
+      if (ENC.drCoil && DG) coil(ENC.drCoil, rW(eW), thW, ENC.drCoil.c[0] - rW(eW), DG.anchorY - dd, -1);
     }
     if (ENC.pb) {                                                  // phone bed: bed group turned about Y; strut body (wall stud) + rod (bed stud)
       const P = LAB.PB, G = P.G, q = P.poseNow(), f = G.strut.f, a = P.toLab(q.P, q.phi, G.strut.a), L = Math.hypot(a[0] - f[0], a[1] - f[1]);
