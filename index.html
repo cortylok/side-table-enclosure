@@ -4213,7 +4213,7 @@ if (typeof module !== "undefined") module.exports = LAB;
   const groupOf = (p) => p.group.startsWith("linkage") ? "linkage" : p.group;
   // a part's own mode (set on its card: solid / see-through / hidden, corty 2026-10-31) wins over its group's mode;
   // a group or "All" button clears the own modes of the parts it sets
-  const pmode = (o) => o.pm || mode[o.g];
+  const pmode = (o) => o.pm || (o.xdef && mode[o.g] === "solid" ? "xray" : mode[o.g]);   // o.xdef: see-through by default (the big drawer cleats, 2026-11-25)
   function setMat(m, md, g) {                                 // opac: set on the part's card slider
     const gh = m.userData.ghost, x = md === "xray", t = x || gh;
     m.transparent = t; m.opacity = gh ? 0.28 : x ? (m.userData.opac ?? (g === "walls" ? 0.12 : 0.3)) : 1; m.depthWrite = !t; m.needsUpdate = true;
@@ -5290,6 +5290,8 @@ if (typeof module !== "undefined") module.exports = LAB;
     }
     return pts;
   }
+  // round cable through points [[x, y, z], ...] (centripetal spline: no overshoot at the bends)
+  const gTube = (pts, r, n) => idxify(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts.map((q) => EV(q[0], q[1], q[2])), false, "centripetal"), n || Math.max(24, pts.length * 8), r, 8, false));
   function mergeGeos(list) {                                                   // one body from several (triangle soup, then indexed)
     const parts = list.map((g) => (g.index ? g.toNonIndexed() : g).attributes.position.array), n = parts.reduce((s, a) => s + a.length, 0), out = new Float32Array(n);
     let o = 0; for (const a of parts) { out.set(a, o); o += a.length; }
@@ -5501,7 +5503,9 @@ if (typeof module !== "undefined") module.exports = LAB;
           L.push([q[0] - dz / n * 3.1, q[1] + dy / n * 3.1]); Rt.push([q[0] + dz / n * 3.1, q[1] - dy / n * 3.1]); });
         const b = p.b; geo = gPrismX([[b[2], b[4]], [b[3], b[4]], [b[3], b[5]], [b[2], b[5]]], b[0], b[1], [L.concat(Rt.reverse())]);
       }
-      const o = encAdd(geo, "drawermech", "fixed", p.nm, dr(p), p.hex); if (/\+X slide mounting cleat/.test(p.nm)) o.sub = true; if (p.track || /Slide|cleat ST-E6/.test(p.nm)) o.drx = true; }   // (the linear rails stay solid in the Drawer mechanism view: they are the guide now)
+      const o = encAdd(geo, "drawermech", "fixed", p.nm, dr(p), p.hex); if (/\+X slide mounting cleat/.test(p.nm)) o.sub = true;
+      // corty 2026-11-25: the big cleats see-through by default (the card's buttons still set solid)
+      if (/^Drawer [+-]X (slide mounting )?cleat|^-X cleat/.test(p.nm)) { ownMat(o); o.xdef = true; } if (p.track || /Slide|cleat ST-E6/.test(p.nm)) o.drx = true; }   // (the linear rails stay solid in the Drawer mechanism view: they are the guide now)
     {                                                                         // tilt drive: bellcrank (turns about B), link, pin; slot path
       const dv = DG.drive, k0 = LAB.drKinAt(0), B = dv.B, J = k0.J, K = k0.K, pin = k0.pin, rows = [["Part", "ST-E52 bellcrank (6061 3 mm), pivot on the -X carriage bar"]];
       const bar = (a, b, w) => { const dy = b[0] - a[0], dz = b[1] - a[1], L = Math.hypot(dy, dz), ny = -dz / L * w / 2, nz = dy / L * w / 2; return [[a[0] + ny, a[1] + nz], [b[0] + ny, b[1] + nz], [b[0] - ny, b[1] - nz], [a[0] - ny, a[1] - nz]]; };
@@ -5637,10 +5641,15 @@ if (typeof module !== "undefined") module.exports = LAB;
       const body = encAdd(gCyl(EV(0, 0, 0), EV(0, 0, 1), Lb, 7.5, 24), "phone", "pbstrut", "Phone wedge gas strut (body)", info([["Strut", "corty's: 20 N, 280 between the eyes extended, 105 travel"], ["Lower stud", `on the bed-side wall, X ${G.strut.f[0]} Z ${G.strut.f[1]} (above the -X drawer cleat)`]]), 0x444a50);
       const rod = encAdd(gCyl(EV(0, 0, 0), EV(0, 0, 1), 1, 3, 16), "phone", "pbstrut", "Phone wedge gas strut (rod)", info([["Upper stud", `on the bottom face's outside, bed-local (${G.strut.a.join(", ")})`]]), 0xcfd6dc);
       ENC.pb = { mv, body, rod, ys, Lb, loop, tube, phi: null }; }
-    ENC.cables = DG.cables.flatMap((c) => { const a = encLine("cables", "drawer", c.hex), b = encLine("cables", "drawer", c.hex);
-      a.geometry.setFromPoints(c.car.map((q) => EV(...q))); b.geometry.setFromPoints(c.tray.map((q) => EV(...q))); a.userData.part = "car"; b.userData.part = "tray";
-      if (!c.loop) return [a, b];
-      const l = encLine("cables", "drawer", c.hex); l.userData.part = "loop"; l.userData.c = c; return [a, b, l]; });
+    // device leads (corty 2026-11-25: "thick and physical", like the phone bed's): D4 tubes, not lines. car part rides the carriage,
+    // tray part turns with the tray, the hanging loop is rebuilt for each pose
+    { const r = ((LAB.HOLD && LAB.HOLD.leadD) || 4) / 2, info = (c, t) => R_INFO([["Lead", `${c.nm}, D${2 * r} braided`], ["Route", t]]);
+      ENC.cables = DG.cables.flatMap((c) => {
+        const a = encAdd(gTube(c.car, r), "drawer", "drawer", `${c.nm} (on the carriage)`, info(c, "chain end -> lane behind the +X post -> mast clips -> comb finger"), c.hex);
+        const b = encAdd(gTube(c.tray, r), "drawer", "tray", `${c.nm} (in the tray)`, info(c, "along the tray to the device"), c.hex);
+        if (!c.loop) return [];
+        const l = encAdd(gTube(LAB.leadPts(c.i, 0), r, 40), "drawer", "fixed", `${c.nm} (hanging loop)`, info(c, "hangs from its comb finger to the device's rear top corner; follows the drawer"), c.hex);
+        return [{ o: l, c, r }]; }); }
     if (ENC.isoOn) { ENC.isoSet = new Set(objs.filter((o) => o.sub)); iso = ENC.isoSet; }
     if (ENC.isoDrOn) drIsoApply();
     if (!ENC.first) { applyModes(); encPose(); scheduleChecks(); }
@@ -5727,11 +5736,8 @@ if (typeof module !== "undefined") module.exports = LAB;
       for (const o of ENC.chainLinks) { const lk = c.links[o.k]; if (!lk) continue;
         o.mesh.position.set(ENC_OFF.x + lk.x, ENC_OFF.y + lk.y, ENC_OFF.z + ENC.chainZ); o.mesh.rotation.set(0, 0, lk.a); }
     }
-    for (const l of ENC.cables || []) {
-      if (l.userData.part === "loop") {                                // v3 step 2: the lead hangs from its comb finger (carriage) to the device's rear top corner (tray)
-        const pts = LAB.leadPts(l.userData.c.i, dd).map((q) => EV(q[0], q[1], q[2]));
-        l.position.set(ENC_OFF.x, ENC_OFF.y, ENC_OFF.z); l.quaternion.identity(); l.geometry.setFromPoints(pts); }
-      else if (l.userData.part === "tray") trayPose(l, dd); else { l.position.set(ENC_OFF.x, ENC_OFF.y - dd, ENC_OFF.z); l.quaternion.identity(); } }
+    for (const L of ENC.cables || []) if (L.dd !== dd) {               // v3 step 2: the lead hangs from its comb finger (carriage) to the device's rear top corner (tray)
+      L.dd = dd; const m = L.o.mesh; m.geometry.dispose(); m.geometry = gTube(LAB.leadPts(L.c.i, dd), L.r, 40); }
     dirty = true; shadowDirty();
   }
   // v2 tray: turn about the pivot (lab Y, Z when closed) by the tilt at d, then move -d. Object geometry is in the lab frame at ENC_OFF.
